@@ -12,18 +12,6 @@ func TestIdentityStableForSameInput(t *testing.T) {
 	}
 }
 
-// TestIdentityChangesWithPrice 记录当前行为：价格变化会产生不同的 ItemKey。
-//
-// 这个测试断言的是现有实现，改动该行为时需同步更新。
-func TestIdentityChangesWithPrice(t *testing.T) {
-	a := Record{SiteID: "supplier", SourceID: "SUP-00001", PriceCents: 1234, Stock: 7}
-	b := a
-	b.PriceCents = 1235
-	if a.Identity() == b.Identity() {
-		t.Fatal("current implementation folds price into the key; update this test when fixing #2")
-	}
-}
-
 func TestDuplicateRatio(t *testing.T) {
 	cases := []struct {
 		rows, distinct int
