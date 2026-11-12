@@ -1,0 +1,39 @@
+database_url: postgres://aqueduct:aqueduct@db:5432/aqueduct?sslmode=disable
+redis_url: redis://cache:6379/0
+
+sites:
+  - id: supplier
+    base_url: http://mocktarget:9100
+    path: /supplier/items
+    mode: cursor
+    page_size: 50
+    interval: 30s
+    rps: 4
+    enabled: true
+
+  - id: catalog
+    base_url: http://mocktarget:9100
+    path: /catalog/items
+    mode: page
+    page_size: 40
+    interval: 45s
+    rps: 2
+    enabled: true
+
+  - id: stock
+    base_url: http://mocktarget:9100
+    path: /stock/items
+    mode: cursor
+    page_size: 60
+    interval: 60s
+    rps: 2
+    enabled: true
+
+  - id: notice
+    base_url: http://mocktarget:9100
+    path: /notice/items
+    mode: single
+    page_size: 100
+    interval: 120s
+    rps: 1
+    enabled: true
