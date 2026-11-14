@@ -53,6 +53,11 @@ type Run struct {
 	Status     string     `json:"status"`
 	ItemsSeen  int        `json:"items_seen"`
 	ItemsWrote int        `json:"items_written"`
+	// 预算治理分类计数：实际 HTTP 尝试数、配额等待、上游限流、降级使用。
+	HTTPAttempts int `json:"http_attempts"`
+	QuotaWaits   int `json:"quota_waits"`
+	RateLimited  int `json:"rate_limited"`
+	FallbackUses int `json:"fallback_uses"`
 }
 
 // SiteStats 是单站点的落库统计，供 /stats 与验证脚本使用。

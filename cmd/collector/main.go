@@ -9,7 +9,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/internal-platform/aqueduct/internal/api"
+	"github.com/internal-platform/aqueduct/internal/budget"
 	"github.com/internal-platform/aqueduct/internal/collector"
 	"github.com/internal-platform/aqueduct/internal/config"
 	"github.com/internal-platform/aqueduct/internal/metrics"
@@ -43,20 +46,34 @@ func main() {
 		log.Fatalf("migrate: %v", err)
 	}
 
-	var reqs *metrics.Requests
+	var (
+		reqs    *metrics.Requests
+		rdb     *redis.Client
+		budgets *budget.Registry
+	)
 	if cfg.RedisURL != "" {
-		reqs, err = metrics.Open(ctx, cfg.RedisURL)
+		client, err := budget.OpenRedis(ctx, cfg.RedisURL)
 		if err != nil {
-			// 不阻断启动：Redis 只用于计数，缺了不影响采集。
-			log.Printf("warn: redis unavailable (%v), request counters disabled", err)
-			reqs = nil
+			// 不阻断启动：预算治理降级为实例内本地限流，请求计数同时关闭。
+			log.Printf("warn: redis unavailable (%v), budget governance in local mode", err)
+			rdb = nil
 		} else {
-			defer reqs.Close()
+			rdb = client
+			defer rdb.Close()
+			reqs = metrics.New(rdb)
 		}
 	}
-
-	log.Printf("worker=%s db ready", cfg.WorkerID)
-	col := collector.New(cfg, st, reqs)
+	budgets, err = budget.NewRegistry(cfg, rdb)
+	if err != nil {
+		log.Fatalf("build budget registry: %v", err)
+	}
+	defer budgets.Close()
+	if rdb == nil {
+		log.Printf("worker=%s db ready, budget=local (no shared backend)", cfg.WorkerID)
+	} else {
+		log.Printf("worker=%s db ready, budget=redis (distributed)", cfg.WorkerID)
+	}
+	col := collector.New(cfg, st, budgets, reqs)
 
 	switch *mode {
 	case "once":
@@ -74,7 +91,7 @@ func main() {
 		}
 		log.Printf("ok seen=%d wrote=%d run=%s", run.ItemsSeen, run.ItemsWrote, run.ID)
 	case "api":
-		srv := api.New(cfg, st, col, reqs)
+		srv := api.New(cfg, st, col, reqs, budgets)
 		if err := srv.ListenAndServe(); err != nil {
 			log.Printf("api stopped: %v", err)
 		}
@@ -83,7 +100,7 @@ func main() {
 			log.Printf("runner stopped: %v", err)
 		}
 	case "all":
-		srv := api.New(cfg, st, col, reqs)
+		srv := api.New(cfg, st, col, reqs, budgets)
 		go func() {
 			if err := srv.ListenAndServe(); err != nil {
 				log.Printf("api stopped: %v", err)

@@ -38,7 +38,7 @@ func TestPageParsesCursor(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(testSite(srv.URL))
+	c := New(testSite(srv.URL), nil)
 	p, err := c.Page(context.Background(), "7")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -63,7 +63,7 @@ func TestPageClassifiesRateLimit(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := New(testSite(srv.URL)).Page(context.Background(), "")
+	_, err := New(testSite(srv.URL), nil).Page(context.Background(), "")
 	if !errors.Is(err, ErrRateLimited) {
 		t.Fatalf("want ErrRateLimited, got %v", err)
 	}
@@ -76,7 +76,7 @@ func TestPageClassifiesServerError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := New(testSite(srv.URL)).Page(context.Background(), "")
+	_, err := New(testSite(srv.URL), nil).Page(context.Background(), "")
 	if !errors.Is(err, ErrServerError) {
 		t.Fatalf("want ErrServerError, got %v", err)
 	}
@@ -93,7 +93,7 @@ func TestPageModeUsesPageParam(t *testing.T) {
 
 	site := testSite(srv.URL)
 	site.Mode = "page"
-	if _, err := New(site).Page(context.Background(), ""); err != nil {
+	if _, err := New(site, nil).Page(context.Background(), ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -104,7 +104,7 @@ func TestBadUpdatedAtFallsBackToNow(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	p, err := New(testSite(srv.URL)).Page(context.Background(), "")
+	p, err := New(testSite(srv.URL), nil).Page(context.Background(), "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

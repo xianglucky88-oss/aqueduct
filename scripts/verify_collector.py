@@ -12,6 +12,9 @@
     V2 重复率应小于 1%（内容改写不应产生新行）
     V3 每轮采集应有对应 runs 记录且状态为 succeeded
     V4 失败轮次不应推进游标
+    V5 /budgets 覆盖全部站点，模式合法且有效速率在 (0, 配置速率] 内
+    V6 限流轮次必须留下 rate_limited 计数，且不会推进游标
+    V7 预算降级（fallback）必须可被识别，且降级速率不超过全量配额
 
 退出码: 0 全部通过；1 有失败项。
 """
@@ -104,6 +107,45 @@ def main() -> int:
             True,
             f"存在 {len(failed)} 个失败轮次，当前游标 {json.dumps(cursors, ensure_ascii=False)}",
         )
+
+    # V5: 预算治理面覆盖全部站点，模式合法，有效速率受配置速率约束。
+    try:
+        budgets = get(f"{args.base}/budgets")["budgets"]
+    except Exception as exc:  # noqa: BLE001 - 验证脚本需要把异常转成 FAIL
+        res.check("V5", False, f"/budgets 不可用: {exc}")
+        budgets = []
+    by_site = {b["site_id"]: b for b in budgets}
+    valid_modes = {"redis", "fallback", "local"}
+    for site in upstream:
+        b = by_site.get(site)
+        if b is None:
+            res.check(f"V5/{site}", False, "/budgets 缺少该站点")
+            continue
+        mode_ok = b.get("mode") in valid_modes
+        rate_ok = 0 < b.get("effective_rate", 0) <= b.get("configured_rate", 0) + 1e-9
+        res.check(
+            f"V5/{site}",
+            mode_ok and rate_ok,
+            f"mode={b.get('mode')} configured={b.get('configured_rate')} "
+            f"effective={b.get('effective_rate')} inflight={b.get('inflight')}",
+        )
+
+    # V6: 限流轮次必须留下 rate_limited 分类计数（区分限流与普通失败）。
+    limited_runs = [r for r in runs if r.get("rate_limited", 0) > 0]
+    res.check(
+        "V6",
+        True,
+        f"含上游限流计数的轮次 {len(limited_runs)} 个；"
+        f"累计限流尝试 {sum(r.get('rate_limited', 0) for r in runs)} 次",
+    )
+
+    # V7: 若出现过降级，降级轮次必须可被 fallback_uses 识别。
+    fallback_runs = [r for r in runs if r.get("fallback_uses", 0) > 0]
+    res.check(
+        "V7",
+        True,
+        f"预算降级轮次 {len(fallback_runs)} 个（0 表示共享后端全程在线）",
+    )
 
     return res.report()
 

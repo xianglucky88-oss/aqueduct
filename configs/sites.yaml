@@ -10,6 +10,15 @@ sites:
     interval: 30s
     rps: 4
     enabled: true
+    # 可选的站点级分布式请求预算。留空（其余站点即如此）时：
+    # rate=rps、burst=ceil(rps)、max_inflight=1、max_attempts=1（不重试），
+    # 与本特性引入前的含义完全一致。
+    budget:
+      rate: 4              # 集群所有实例共享的长期速率（请求/秒）
+      burst: 6             # 令牌桶容量，约束短时突发
+      max_inflight: 2      # 集群范围内该站点的并发在途上限
+      max_attempts: 3      # 单页最大尝试次数，重试同样消耗预算
+      fallback_fraction: 0.5 # Redis 失联时单实例降级到全量配额的 50%
 
   - id: catalog
     base_url: http://localhost:9100

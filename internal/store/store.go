@@ -72,8 +72,17 @@ func (s *Store) Migrate(ctx context.Context) error {
 			finished_at TIMESTAMPTZ,
 			status      TEXT NOT NULL,
 			items_seen  INTEGER NOT NULL DEFAULT 0,
-			items_wrote INTEGER NOT NULL DEFAULT 0
+			items_wrote INTEGER NOT NULL DEFAULT 0,
+			http_attempts   INTEGER NOT NULL DEFAULT 0,
+			quota_waits     INTEGER NOT NULL DEFAULT 0,
+			rate_limited    INTEGER NOT NULL DEFAULT 0,
+			fallback_uses   INTEGER NOT NULL DEFAULT 0
 		)`,
+		// 旧库平滑升级：列已存在时忽略错误。
+		`ALTER TABLE runs ADD COLUMN IF NOT EXISTS http_attempts INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE runs ADD COLUMN IF NOT EXISTS quota_waits INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE runs ADD COLUMN IF NOT EXISTS rate_limited INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE runs ADD COLUMN IF NOT EXISTS fallback_uses INTEGER NOT NULL DEFAULT 0`,
 		`CREATE TABLE IF NOT EXISTS cursors (
 			site_id     TEXT PRIMARY KEY,
 			cursor      TEXT NOT NULL DEFAULT '',
@@ -151,11 +160,14 @@ func (s *Store) StartRun(ctx context.Context, run model.Run) error {
 	return err
 }
 
-// FinishRun 更新运行记录。
-func (s *Store) FinishRun(ctx context.Context, runID, status string, seen, wrote int) error {
+// FinishRun 更新运行记录，并写入预算治理相关的尝试分类计数。
+func (s *Store) FinishRun(ctx context.Context, runID, status string, seen, wrote,
+	attempts, quotaWaits, rateLimited, fallbackUses int) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE runs SET finished_at = now(), status = $2, items_seen = $3, items_wrote = $4 WHERE run_id = $1`,
-		runID, status, seen, wrote)
+		`UPDATE runs SET finished_at = now(), status = $2, items_seen = $3, items_wrote = $4,
+		 http_attempts = $5, quota_waits = $6, rate_limited = $7, fallback_uses = $8
+		 WHERE run_id = $1`,
+		runID, status, seen, wrote, attempts, quotaWaits, rateLimited, fallbackUses)
 	return err
 }
 

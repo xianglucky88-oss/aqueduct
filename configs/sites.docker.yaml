@@ -10,6 +10,15 @@ sites:
     interval: 30s
     rps: 4
     enabled: true
+    # 可选的站点级分布式请求预算。留空（其余站点即如此）时：
+    # rate=rps、burst=ceil(rps)、max_inflight=1、max_attempts=1（不重试），
+    # 与本特性引入前的含义完全一致。
+    budget:
+      rate: 4
+      burst: 6
+      max_inflight: 2
+      max_attempts: 3
+      fallback_fraction: 0.5
 
   - id: catalog
     base_url: http://mocktarget:9100

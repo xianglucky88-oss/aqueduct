@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/internal-platform/aqueduct/internal/budget"
 	"github.com/internal-platform/aqueduct/internal/collector"
 	"github.com/internal-platform/aqueduct/internal/config"
 	"github.com/internal-platform/aqueduct/internal/metrics"
@@ -19,23 +20,27 @@ import (
 //
 //	GET  /healthz              健康检查
 //	GET  /stats?with_requests=1 落库统计、重复率、可选请求计数
-//	GET  /runs?limit=20        最近运行记录
+//	GET  /runs?limit=20        最近运行记录（含预算分类计数）
+//	GET  /budgets              各站点预算治理状态（模式/有效速率/在途/收缩）
 //	POST /collect/{site}       手动触发一次采集（同步执行）
 type Server struct {
-	cfg  *config.Config
-	st   *store.Store
-	col  *collector.Collector
-	reqs *metrics.Requests
-	http *http.Server
+	cfg     *config.Config
+	st      *store.Store
+	col     *collector.Collector
+	reqs    *metrics.Requests
+	budgets *budget.Registry
+	http    *http.Server
 }
 
 // New 构造 API 服务。
-func New(cfg *config.Config, st *store.Store, col *collector.Collector, reqs *metrics.Requests) *Server {
-	s := &Server{cfg: cfg, st: st, col: col, reqs: reqs}
+func New(cfg *config.Config, st *store.Store, col *collector.Collector,
+	reqs *metrics.Requests, budgets *budget.Registry) *Server {
+	s := &Server{cfg: cfg, st: st, col: col, reqs: reqs, budgets: budgets}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/stats", s.handleStats)
 	mux.HandleFunc("/runs", s.handleRuns)
+	mux.HandleFunc("/budgets", s.handleBudgets)
 	mux.HandleFunc("/collect/", s.handleCollect)
 	s.http = &http.Server{
 		Addr:              ":8081",
@@ -96,7 +101,8 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	rows, err := s.st.DB().QueryContext(r.Context(), `
-		SELECT run_id, site_id, started_at, finished_at, status, items_seen, items_wrote
+		SELECT run_id, site_id, started_at, finished_at, status, items_seen, items_wrote,
+		       http_attempts, quota_waits, rate_limited, fallback_uses
 		FROM runs ORDER BY started_at DESC LIMIT $1`, limit)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -107,7 +113,9 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var run model.Run
 		var fin *time.Time
-		if err := rows.Scan(&run.ID, &run.SiteID, &run.StartedAt, &fin, &run.Status, &run.ItemsSeen, &run.ItemsWrote); err != nil {
+		if err := rows.Scan(&run.ID, &run.SiteID, &run.StartedAt, &fin, &run.Status,
+			&run.ItemsSeen, &run.ItemsWrote, &run.HTTPAttempts, &run.QuotaWaits,
+			&run.RateLimited, &run.FallbackUses); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
@@ -115,6 +123,23 @@ func (s *Server) handleRuns(w http.ResponseWriter, r *http.Request) {
 		out = append(out, run)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"runs": out})
+}
+
+// handleBudgets 暴露各站点预算治理的实时状态。
+//
+// mode 区分 redis（分布式生效）/ fallback（后端失联、本地折减）/ local（单机）；
+// effective_rate 低于 configured_rate 即表示正处于限流收缩或恢复过程中。
+func (s *Server) handleBudgets(w http.ResponseWriter, r *http.Request) {
+	if s.budgets == nil {
+		writeJSON(w, http.StatusServiceUnavailable,
+			map[string]string{"error": "budget registry not configured"})
+		return
+	}
+	snaps := s.budgets.Snapshots(r.Context())
+	if snaps == nil {
+		snaps = []budget.Snapshot{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"budgets": snaps})
 }
 
 func (s *Server) handleCollect(w http.ResponseWriter, r *http.Request) {

@@ -61,5 +61,29 @@ services:
     volumes:
       - ./configs:/app/configs:ro
 
+  # 可选的第二个采集实例，用于验证多实例共享同一份站点预算。
+  # 默认不启动；需要时执行：docker compose --profile multiworker up -d
+  collector-b:
+    profiles: ["multiworker"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TARGET: collector
+    command: ["-config", "configs/sites.docker.yaml", "-mode", "runner"]
+    environment:
+      WORKER_ID: worker-b
+      DATABASE_URL: postgres://aqueduct:aqueduct@db:5432/aqueduct?sslmode=disable
+      REDIS_URL: redis://cache:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+      mocktarget:
+        condition: service_healthy
+    volumes:
+      - ./configs:/app/configs:ro
+
 volumes:
   pgdata:

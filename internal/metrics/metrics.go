@@ -8,32 +8,20 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Requests 是每次抓取请求的计数器。
+// Requests 是每次抓取请求的计数器，供 /stats 展示近期请求量。
 //
-// 说明：这个计数器只被写入、从未被任何限流逻辑读取。
-// 站点配额本应基于它做判定，但那一版被砍了，
-// 目前只有写入侧，没有读取侧。
+// 计数只用于观测，不参与限流判定；限流判定由 internal/budget 负责。
 type Requests struct {
 	rdb *redis.Client
 }
 
-// Open 连接 Redis。失败不阻断启动，仅降级为不计数。
-func Open(ctx context.Context, url string) (*Requests, error) {
-	opt, err := redis.ParseURL(url)
-	if err != nil {
-		return nil, fmt.Errorf("parse redis url: %w", err)
-	}
-	rdb := redis.NewClient(opt)
-	pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	if err := rdb.Ping(pingCtx).Err(); err != nil {
-		return nil, fmt.Errorf("ping redis: %w", err)
-	}
-	return &Requests{rdb: rdb}, nil
+// New 基于已有连接构造计数器。rdb 为 nil 时所有方法静默空转。
+func New(rdb *redis.Client) *Requests {
+	return &Requests{rdb: rdb}
 }
 
-// Close 关闭连接。
-func (r *Requests) Close() error { return r.rdb.Close() }
+// Close 由连接的实际拥有方（budget.Registry 的创建处）负责，这里不关闭连接。
+func (r *Requests) Close() error { return nil }
 
 // Incr 为站点累加一次请求计数。键按分钟分桶，保留 2 小时。
 func (r *Requests) Incr(ctx context.Context, siteID string) {
