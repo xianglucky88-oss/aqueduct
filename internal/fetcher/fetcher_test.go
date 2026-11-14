@@ -98,7 +98,8 @@ func TestPageModeUsesPageParam(t *testing.T) {
 	}
 }
 
-func TestBadUpdatedAtFallsBackToNow(t *testing.T) {
+// 非法时间必须保持零值（上游未提供业务时间），不能用本机时间伪造。
+func TestBadUpdatedAtStaysMissing(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"items":[{"source_id":"S1","updated_at":"not-a-time"}],"has_more":false}`))
 	}))
@@ -108,7 +109,22 @@ func TestBadUpdatedAtFallsBackToNow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if p.Items[0].UpdatedAt.IsZero() {
-		t.Fatal("expected fallback timestamp")
+	if !p.Items[0].UpdatedAt.IsZero() {
+		t.Fatalf("bad timestamp must stay zero, got %v", p.Items[0].UpdatedAt)
+	}
+}
+
+func TestPageEmptyUpdatedAtStaysMissing(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"items":[{"source_id":"S1","updated_at":""}],"has_more":false}`))
+	}))
+	defer srv.Close()
+
+	p, err := New(testSite(srv.URL)).Page(context.Background(), "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !p.Items[0].UpdatedAt.IsZero() {
+		t.Fatalf("absent timestamp must stay zero, got %v", p.Items[0].UpdatedAt)
 	}
 }

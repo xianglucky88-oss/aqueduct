@@ -12,6 +12,9 @@
     V2 重复率应小于 1%（内容改写不应产生新行）
     V3 每轮采集应有对应 runs 记录且状态为 succeeded
     V4 失败轮次不应推进游标
+    V5 同一来源对象只有一个当前状态（rows == distinct_source_ids）
+    V6 历史版本数不少于当前行数（每次真实变化至少一个版本）
+    V7 迁移完成：temporal_reads_ready 为真，且没有 pending 站点
 
 退出码: 0 全部通过；1 有失败项。
 """
@@ -86,6 +89,32 @@ def main() -> int:
             ratio < 0.01,
             f"重复率 {ratio:.2%}（阈值 1%），行数 {s['rows']} 去重 {s['distinct_source_ids']}",
         )
+
+    # V5: 一个来源对象只有一个当前状态
+    for s in stats["sites"]:
+        res.check(
+            f"V5/{s['site_id']}",
+            s["rows"] == s["distinct_source_ids"],
+            f"当前行 {s['rows']} / 去重来源 {s['distinct_source_ids']}",
+        )
+
+    # V6: 历史版本应覆盖当前行，且可多于当前行（发生过变化）
+    for s in stats["sites"]:
+        versions = s.get("versions", 0)
+        res.check(
+            f"V6/{s['site_id']}",
+            versions >= s["rows"],
+            f"历史版本 {versions} / 当前行 {s['rows']}",
+        )
+
+    # V7: 迁移完成
+    mig = stats.get("migration", {})
+    res.check(
+        "V7",
+        bool(mig.get("temporal_reads_ready")) and not mig.get("pending_sites"),
+        f"temporal_reads_ready={mig.get('temporal_reads_ready')} "
+        f"pending={mig.get('pending_sites')}",
+    )
 
     # V3: 运行记录
     runs = get(f"{args.base}/runs?limit=50")["runs"]

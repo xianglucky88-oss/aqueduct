@@ -7,7 +7,7 @@
 //	GET  /api/v1/health
 //	GET  /{site}/items?page|  cursor & page_size   分页拉取
 //	GET  /admin/state                               查看当前数据集指纹
-//	POST /admin/shift?ratio=0.3                     按确定性规则改价/改库存
+//	POST /admin/shift?ratio=0.3&time=forward|back   按确定性规则改价/改库存
 //	POST /admin/fault?site=supplier&kind=429&rate=0.2&seed=7
 //	POST /admin/fault/clear
 //	POST /admin/reset                               重置故障与数据
@@ -270,12 +270,12 @@ func (s *server) handleState(w http.ResponseWriter, r *http.Request) {
 			sum += it.PriceCents
 		}
 		out[id] = map[string]any{
-			"items":       len(st.items),
-			"version":     st.version,
-			"price_sum":   sum,
-			"mode":        st.mode,
-			"requests":    s.requests[id],
-			"fault":       faultDesc(s.fault, id),
+			"items":     len(st.items),
+			"version":   st.version,
+			"price_sum": sum,
+			"mode":      st.mode,
+			"requests":  s.requests[id],
+			"fault":     faultDesc(s.fault, id),
 		}
 	}
 	writeJSON(w, 200, out)
@@ -293,8 +293,16 @@ func faultDesc(f *fault, site string) string {
 
 // handleShift 按确定性规则修改一部分商品的价格与库存。
 //
-// 用于演示"内容改写"场景：
-// shift 之后重新采集，若 ItemKey 含可变字段，行数会膨胀。
+// 用于演示「内容改写」场景：shift 之后重新采集，
+// 内容差异会进入历史版本，而不是产生新对象。
+//
+// 参数：
+//
+//	ratio=0.3            改价比例
+//	time=forward|back    业务时间方向（默认 forward）
+//
+// time=back 会让被改动的条目声明一个更早的 updated_at，
+// 用于演示「上游时间倒退不得覆盖较新事实」。
 func (s *server) handleShift(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, 405, map[string]string{"error": "POST only"})
@@ -306,11 +314,32 @@ func (s *server) handleShift(w http.ResponseWriter, r *http.Request) {
 			ratio = f
 		}
 	}
+	back := r.URL.Query().Get("time") == "back"
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, st := range s.sites {
 		st.version++
 		rnd := rand.New(rand.NewSource(int64(st.version)*7919 + int64(len(st.items))))
+		// 以当前最大业务时间为基准推进，模拟正常的事实更新。
+		// 时间必须单调前进，否则采集端会按冲突规则拒绝旧时间戳。
+		var maxTS, minTS time.Time
+		for _, it := range st.items {
+			ts, err := time.Parse(time.RFC3339, it.UpdatedAt)
+			if err != nil {
+				continue
+			}
+			if maxTS.IsZero() || ts.After(maxTS) {
+				maxTS = ts
+			}
+			if minTS.IsZero() || ts.Before(minTS) {
+				minTS = ts
+			}
+		}
+		stamp := maxTS.Add(time.Duration(st.version) * time.Hour).Format(time.RFC3339)
+		if back {
+			// 落后于已知最早时间 1 小时，必然被采集端判为倒退。
+			stamp = minTS.Add(-time.Hour).Format(time.RFC3339)
+		}
 		for i := range st.items {
 			if rnd.Float64() < ratio {
 				// 价格上调 5%~15%，库存减少。
@@ -322,7 +351,7 @@ func (s *server) handleShift(w http.ResponseWriter, r *http.Request) {
 						st.items[i].Stock = 0
 					}
 				}
-				st.items[i].UpdatedAt = s.baseTime.Add(time.Duration(st.version) * time.Hour).Format(time.RFC3339)
+				st.items[i].UpdatedAt = stamp
 			}
 		}
 	}

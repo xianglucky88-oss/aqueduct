@@ -16,10 +16,38 @@ jobs:
           cache: true
       - name: vet
         run: go vet ./...
-      - name: test
+      - name: test (unit)
         run: go test ./... -count=1 -race
       - name: build
         run: go build ./...
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: build
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: aqueduct
+          POSTGRES_PASSWORD: aqueduct
+          POSTGRES_DB: aqueduct
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U aqueduct -d aqueduct"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+      # 集成测试会为每个用例建一个独立 database，所以用 postgres 维护库。
+      - name: test (real Postgres: migration / temporal / concurrency)
+        env:
+          AQUEDUCT_TEST_DSN: postgres://aqueduct:aqueduct@127.0.0.1:5432/aqueduct?sslmode=disable
+        run: go test ./... -count=1 -race
 
   compose-smoke:
     runs-on: ubuntu-latest

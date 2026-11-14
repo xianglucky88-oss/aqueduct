@@ -9,6 +9,7 @@ help:
 	@echo "make down     停止并清理容器"
 	@echo "make demo     跑一次可复现的采集演示（含故障注入与去重检查）"
 	@echo "make test     Go 单元测试"
+	@echo "make test-integration  真实 Postgres 集成测试（迁移/历史/并发）"
 	@echo "make lint     go vet"
 	@echo "make verify   跑 verify_collector.py 断言脚本"
 	@echo "make local-mock  仅在本机起 mocktarget（端口 9100）"
@@ -35,6 +36,12 @@ demo:
 .PHONY: test
 test:
 	go test ./... -count=1
+
+# 真实 Postgres 上的迁移 / 历史 / 并发测试。
+# 需要一个可建库的账号；每个用例自建独立 database。
+.PHONY: test-integration
+test-integration:
+	AQUEDUCT_TEST_DSN='$(AQUEDUCT_TEST_DSN)' go test ./... -count=1 -race
 
 .PHONY: lint
 lint:

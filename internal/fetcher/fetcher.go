@@ -134,10 +134,17 @@ type wirePage struct {
 func (w wirePage) toPage(siteID string) *model.Page {
 	p := &model.Page{NextCursor: w.NextCursor, HasMore: w.HasMore}
 	for _, it := range w.Items {
-		ts, err := time.Parse(time.RFC3339, it.UpdatedAt)
-		if err != nil {
-			log.Printf("warn: bad updated_at %q on %s/%s", it.UpdatedAt, siteID, it.SourceID)
-			ts = time.Now().UTC()
+		var ts time.Time
+		if it.UpdatedAt != "" {
+			parsed, err := time.Parse(time.RFC3339, it.UpdatedAt)
+			if err != nil {
+				// 非法时间视为「上游未提供时间」，保持零值。
+				// 采集层不得用本机时间伪造业务时间，否则会覆盖更晚的真实事实。
+				log.Printf("warn: bad updated_at %q on %s/%s; treating as missing",
+					it.UpdatedAt, siteID, it.SourceID)
+			} else {
+				ts = parsed
+			}
 		}
 		rec := model.Record{
 			SiteID:     siteID,

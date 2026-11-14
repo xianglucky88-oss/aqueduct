@@ -32,10 +32,23 @@ func New(cfg *config.Config, st *store.Store, reqs *metrics.Requests) *Collector
 // 当前实现的行为：
 //  1. 游标只在整轮成功后一次性落库。任何一页失败，前面已写入的数据保留，
 //     游标停留在本轮起点，下一轮从该处重新抓取。
-//  2. 落库唯一键由 Identity() 计算，哈希里含价格与库存，
-//     上游内容改变后会生成新的 ItemKey。
-//  3. 租约表已建好，但采集流程未申请租约。
+//  2. 落库唯一键由 Identity() 计算，只含 (site_id, source_id)，
+//     因此上游调价/改库存不会产生新对象；内容变化进入历史版本。
+//  3. 业务时间倒退或缺失的观测被 Apply 拒绝，不覆盖较新的业务事实。
+//  4. 租约表已建好，但采集流程未申请租约。
 func (c *Collector) RunSite(ctx context.Context, site config.Site) (model.Run, error) {
+	return c.runSite(ctx, site, false)
+}
+
+// RunSiteFull 忽略已保存的游标，从第一页开始重新扫描。
+//
+// 用于运维需要全量复核时；成功后游标照常推进到最后位置。
+// 不做全量重采也能建立历史：迁移本身已经还原了旧数据里的版本。
+func (c *Collector) RunSiteFull(ctx context.Context, site config.Site) (model.Run, error) {
+	return c.runSite(ctx, site, true)
+}
+
+func (c *Collector) runSite(ctx context.Context, site config.Site, fromStart bool) (model.Run, error) {
 	run := model.Run{
 		ID:        uuid.NewString(),
 		SiteID:    site.ID,
@@ -48,7 +61,8 @@ func (c *Collector) RunSite(ctx context.Context, site config.Site) (model.Run, e
 
 	fail := func(err error) (model.Run, error) {
 		run.Status = "failed"
-		if e := c.store.FinishRun(ctx, run.ID, "failed", run.ItemsSeen, run.ItemsWrote); e != nil {
+		run.FinishedAt = ptr(time.Now().UTC())
+		if e := c.store.FinishRun(ctx, run); e != nil {
 			log.Printf("finish run %s: %v", run.ID, e)
 		}
 		return run, err
@@ -57,6 +71,9 @@ func (c *Collector) RunSite(ctx context.Context, site config.Site) (model.Run, e
 	start, err := c.store.Cursor(ctx, site.ID)
 	if err != nil {
 		return fail(err)
+	}
+	if fromStart {
+		start = ""
 	}
 
 	client := fetcher.New(site)
@@ -71,11 +88,13 @@ func (c *Collector) RunSite(ctx context.Context, site config.Site) (model.Run, e
 			return fail(err)
 		}
 		run.ItemsSeen += len(p.Items)
-		n, err := c.store.Upsert(ctx, p.Items)
+		res, err := c.store.Apply(ctx, p.Items)
 		if err != nil {
 			return fail(err)
 		}
-		run.ItemsWrote += n
+		run.ItemsWrote += res.Written
+		run.ItemsStale += res.Stale
+		run.ItemsUnchanged += res.Unchanged
 
 		if !p.HasMore || p.NextCursor == "" {
 			break
@@ -91,7 +110,7 @@ func (c *Collector) RunSite(ctx context.Context, site config.Site) (model.Run, e
 
 	run.Status = "succeeded"
 	run.FinishedAt = ptr(time.Now().UTC())
-	if err := c.store.FinishRun(ctx, run.ID, run.Status, run.ItemsSeen, run.ItemsWrote); err != nil {
+	if err := c.store.FinishRun(ctx, run); err != nil {
 		return run, err
 	}
 	return run, nil
