@@ -1,0 +1,227 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aqueduct
+---
+# 站点配置以 ConfigMap 挂载。数据库与 Redis 连接串走 Secret，
+# 不使用 ConfigMap 以免明文出现在 kubectl describe 输出中。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aqueduct-sites
+  namespace: aqueduct
+data:
+  sites.prod.yaml: |
+    # 运行参数默认值见 internal/config.Defaults()，可按环境覆盖。
+    # 这里只放站点定义；连接串与 worker_id 由环境变量注入。
+    sites:
+      - id: supplier
+        base_url: https://supplier.example.com
+        path: /api/v1/items
+        mode: cursor
+        page_size: 50
+        interval: 30s
+        rps: 4
+        enabled: true
+
+      - id: catalog
+        base_url: https://catalog.example.com
+        path: /api/v1/items
+        mode: page
+        page_size: 40
+        interval: 45s
+        rps: 2
+        enabled: true
+
+      - id: stock
+        base_url: https://stock.example.com
+        path: /api/v1/items
+        mode: cursor
+        page_size: 60
+        interval: 60s
+        rps: 2
+        enabled: true
+
+      - id: notice
+        base_url: https://notice.example.com
+        path: /api/v1/items
+        mode: single
+        page_size: 100
+        interval: 120s
+        rps: 1
+        enabled: true
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aqueduct-db
+  namespace: aqueduct
+type: Opaque
+stringData:
+  # 由 CI/密钥管理系统替换；示例值不具有可用性。
+  database_url: postgres://aqueduct:CHANGEME@postgres:5432/aqueduct?sslmode=require&pool_max_conns=8
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aqueduct-redis
+  namespace: aqueduct
+type: Opaque
+stringData:
+  redis_url: redis://:CHANGEME@redis:6379/0
+---
+# 滚动更新策略：默认 RollingUpdate，maxUnavailable=0、maxSurge=1，
+# 保证任何时刻至少有一个就绪副本。配合 readinessProbe 的 draining 语义，
+# 旧 Pod 在新 Pod Ready 之后才收到 SIGTERM。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aqueduct-collector
+  namespace: aqueduct
+  labels:
+    app.kubernetes.io/name: aqueduct-collector
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aqueduct-collector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aqueduct-collector
+    spec:
+      # 必须长于 ShutdownGrace + 探针摘流时间。默认 45s：
+      #   readiness 摘除约 5s + ShutdownGrace 20s + 收尾余量。
+      terminationGracePeriodSeconds: 45
+      # 站点数据只在数据库中，Pod 不落本地状态，可安全驱逐到任意节点。
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: aqueduct-collector
+                topologyKey: kubernetes.io/hostname
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: collector
+          image: registry.example.com/aqueduct/collector:1.5.0
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/etc/aqueduct/sites.prod.yaml", "-mode", "all"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: aqueduct-db
+                  key: database_url
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: aqueduct-redis
+                  key: redis_url
+            - name: LEASE_TTL
+              value: "45s"
+            - name: LEASE_RENEW_INTERVAL
+              value: "15s"
+            - name: SHUTDOWN_GRACE
+              value: "20s"
+            - name: MAX_CONCURRENT_SITES
+              value: "2"
+            - name: DB_MAX_OPEN_CONNS
+              value: "8"
+            - name: DB_MAX_IDLE_CONNS
+              value: "2"
+            - name: MAX_PAGES
+              value: "200"
+          ports:
+            - name: http
+              containerPort: 8081
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 96Mi
+            limits:
+              memory: 192Mi
+          # startupProbe：初始化（迁移、调度器启动）完成前不启用
+          # livez/readyz，避免启动慢被存活探针误杀。
+          startupProbe:
+            httpGet:
+              path: /startupz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 24   # 最多容忍 120s 启动
+          # readyz：数据库不可达或正在终止 => 503，Endpoints 摘除。
+          # Redis 故障只降级为 degraded，仍返回 200。
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+            successThreshold: 1
+          # livez：不检查依赖。数据库故障时保持 Pod 存活，
+          # 由外部恢复后自动重新 Ready，而不是重启制造更多抖动。
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/aqueduct
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: aqueduct-sites
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aqueduct-collector
+  namespace: aqueduct
+spec:
+  # 只暴露管理接口给运维工具使用。采集工作通过租约协调，
+  # 不需要负载均衡，因此这里不承担「分配任务」的职责。
+  selector:
+    app.kubernetes.io/name: aqueduct-collector
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http
+  type: ClusterIP
+---
+# 可选：PodDisruptionBudget 保证节点驱逐时至少保留 1 个副本，
+# 避免整个采集面在维护窗口内全部下线。租约机制保证站点不会漏采，
+# 但保留副本能缩短恢复延迟。
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: aqueduct-collector
+  namespace: aqueduct
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aqueduct-collector

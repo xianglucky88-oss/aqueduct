@@ -39,6 +39,8 @@ services:
       retries: 20
       start_period: 3s
 
+  # 两个副本共享同一数据库，通过站点租约竞争工作。本地用
+  # docker compose up --scale collector=3 可模拟滚动升级与接管。
   collector:
     build:
       context: .
@@ -47,10 +49,17 @@ services:
         TARGET: collector
     command: ["-config", "configs/sites.docker.yaml", "-mode", "all"]
     environment:
-      WORKER_ID: worker-a
+      # Pod/副本名必须唯一；Kubernetes 注入 metadata.name，
+      # 本地 compose 用容器主机名即可。
+      WORKER_ID: ${WORKER_ID:-}
       DATABASE_URL: postgres://aqueduct:aqueduct@db:5432/aqueduct?sslmode=disable
       REDIS_URL: redis://cache:6379/0
+      LEASE_TTL: 45s
+      LEASE_RENEW_INTERVAL: 15s
+      SHUTDOWN_GRACE: 20s
+      MAX_CONCURRENT_SITES: 2
     ports: ["8081:8081"]
+    stop_grace_period: 45s
     depends_on:
       db:
         condition: service_healthy
@@ -58,6 +67,12 @@ services:
         condition: service_healthy
       mocktarget:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
     volumes:
       - ./configs:/app/configs:ro
 

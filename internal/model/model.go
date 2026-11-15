@@ -3,8 +3,17 @@ package model
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"time"
+)
+
+// 运行状态。除 succeeded/failed 外，abandoned 表示「因进程终止或失去租约
+// 而主动放弃」——它既不代表上游故障，也不代表数据丢失：已提交的页和游标
+// 都保留在库内，下一个持有租约的副本会从检查点继续。
+const (
+	RunStatusRunning   = "running"
+	RunStatusSucceeded = "succeeded"
+	RunStatusFailed    = "failed"
+	RunStatusAbandoned = "abandoned"
 )
 
 // Record 是采集落库的最小单元。
@@ -24,12 +33,12 @@ type Record struct {
 
 // Identity 计算库内唯一键。
 //
-// 注意：当前实现把可变字段（价格、库存）一并纳入哈希，
-// 因此同一 SourceID 在价格变动后会得到不同的 ItemKey。
-// ItemKey 因此会随内容变化而变化。
+// 键只由站点与上游业务主键决定，与价格、库存等内容字段无关。
+// 这样同一实体的内容变化会原地更新（UPSERT ... DO UPDATE），而不是
+// 生成新行。这一点对多副本接管尤其重要：接管方从检查点重放某一页时，
+// 即便与中止方发生过重叠写入，也只会有同一行被重复更新，不会产生重复数据。
 func (r Record) Identity() string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%d|%d",
-		r.SiteID, r.SourceID, r.PriceCents, r.Stock)))
+	sum := sha256.Sum256([]byte(r.SiteID + "|" + r.SourceID))
 	return hex.EncodeToString(sum[:8])
 }
 
@@ -42,17 +51,19 @@ type Page struct {
 
 // Run 是一次采集执行的记录。
 //
-// 注意命名：数据库列是 items_wrote，JSON 字段是 items_written。
+// 命名提示：数据库列是 items_wrote，JSON 字段是 items_written。
 // 三者（Go 字段 / JSON / 列名）不完全一致，改动时需同时调整
 // internal/store 的 SQL 与本结构体的 tag。
 type Run struct {
 	ID         string     `json:"run_id"`
 	SiteID     string     `json:"site_id"`
+	WorkerID   string     `json:"worker_id"`
 	StartedAt  time.Time  `json:"started_at"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 	Status     string     `json:"status"`
 	ItemsSeen  int        `json:"items_seen"`
 	ItemsWrote int        `json:"items_written"`
+	LastError  string     `json:"last_error,omitempty"`
 }
 
 // SiteStats 是单站点的落库统计，供 /stats 与验证脚本使用。
@@ -65,11 +76,11 @@ type SiteStats struct {
 
 // Stats 是全局统计。
 type Stats struct {
-	Sites      []SiteStats `json:"sites"`
-	TotalRows  int         `json:"total_rows"`
-	TotalRuns  int         `json:"total_runs"`
-	LastRunAt  string      `json:"last_run_at,omitempty"`
-	Cursors    map[string]string `json:"cursors"`
+	Sites     []SiteStats       `json:"sites"`
+	TotalRows int               `json:"total_rows"`
+	TotalRuns int               `json:"total_runs"`
+	LastRunAt string            `json:"last_run_at,omitempty"`
+	Cursors   map[string]string `json:"cursors"`
 }
 
 // DuplicateRatio 返回重复率：1 - 去重业务主键数 / 总行数。

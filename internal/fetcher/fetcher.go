@@ -3,6 +3,7 @@ package fetcher
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,15 +16,56 @@ import (
 	"github.com/internal-platform/aqueduct/internal/model"
 )
 
-// ErrRateLimited 表示目标站点返回 429。
-var ErrRateLimited = fmt.Errorf("rate limited")
+// 错误分类决定调用方的处置：
+//   - 429 / 5xx / 网络错误：可重试，按退避重采；
+//   - 其他 4xx：不可重试，通常意味着配置或凭据错误；
+//   - 游标被上游拒绝：需要从头开始，而不是无限重试。
+var (
+	ErrRateLimited = errors.New("rate limited")
+	ErrServerError = errors.New("upstream server error")
+	ErrUpstream4xx = errors.New("upstream client error")
+	ErrCursorReset = errors.New("upstream rejected cursor")
+)
 
-// ErrServerError 表示目标站点返回 5xx。
-var ErrServerError = fmt.Errorf("upstream server error")
+// RetryAfterError 携带上游给出的 Retry-After，供调度器优先采用。
+type RetryAfterError struct {
+	Err        error
+	RetryAfter time.Duration
+}
+
+func (e *RetryAfterError) Error() string { return e.Err.Error() }
+func (e *RetryAfterError) Unwrap() error { return e.Err }
+
+// RetryAfter 从任意错误里提取上游建议的重试等待时间。
+func RetryAfter(err error) (time.Duration, bool) {
+	var ra *RetryAfterError
+	if errors.As(err, &ra) {
+		return ra.RetryAfter, true
+	}
+	return 0, false
+}
+
+// Retryable 判断错误是否值得重试。429、5xx 与网络错误可重试；
+// 4xx 配置类错误不可重试。
+func Retryable(err error) bool {
+	switch {
+	case errors.Is(err, ErrRateLimited), errors.Is(err, ErrServerError):
+		return true
+	case errors.Is(err, ErrUpstream4xx), errors.Is(err, ErrCursorReset):
+		return false
+	}
+	// context 取消不是上游问题。
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// 其余视为网络/传输错误，可重试。
+	return true
+}
 
 // Client 是对单个站点的抓取客户端。
 //
-// 历史实现：节流靠一个固定 sleep，没有全局配额，也没有退避。
+// 节流按站点 RPS 做请求间最小间隔，并尊重 ctx，使终止流程不会被
+// sleep 卡住。
 type Client struct {
 	site   config.Site
 	http   *http.Client
@@ -50,7 +92,6 @@ func max(a, b int) int {
 
 // Page 抓取一页。cursor 为空表示第一页。
 func (c *Client) Page(ctx context.Context, cursor string) (*model.Page, error) {
-	// 固定 sleep 节流。
 	elapsed := time.Since(c.lastAt)
 	if elapsed < c.sleep {
 		select {
@@ -86,7 +127,7 @@ func (c *Client) Page(ctx context.Context, cursor string) (*model.Page, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "aqueduct/1.4.0")
+	req.Header.Set("User-Agent", "aqueduct/1.5.0")
 	req.Header.Set("X-Worker", "collector")
 	for k, v := range c.site.Headers {
 		req.Header.Set(k, v)
@@ -100,15 +141,24 @@ func (c *Client) Page(ctx context.Context, cursor string) (*model.Page, error) {
 
 	switch {
 	case resp.StatusCode == http.StatusTooManyRequests:
-		// 直接返回错误，不重试。
+		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
 		io.Copy(io.Discard, resp.Body)
-		return nil, fmt.Errorf("%w: %s", ErrRateLimited, u.String())
+		base := fmt.Errorf("%w: %s", ErrRateLimited, u.String())
+		if retryAfter > 0 {
+			return nil, &RetryAfterError{Err: base, RetryAfter: retryAfter}
+		}
+		return nil, base
+	case resp.StatusCode == http.StatusGone || resp.StatusCode == http.StatusBadRequest:
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		// 游标可能因上游重建索引而失效。交由调用方决定是否重置游标，
+		// 不能简单当作「重试直到成功」，否则会无限重采。
+		return nil, fmt.Errorf("%w: %d %s", ErrCursorReset, resp.StatusCode, string(body))
 	case resp.StatusCode >= 500:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return nil, fmt.Errorf("%w: %d %s", ErrServerError, resp.StatusCode, string(body))
 	case resp.StatusCode >= 400:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("%w: %d %s", ErrUpstream4xx, resp.StatusCode, string(body))
 	}
 
 	var payload wirePage
@@ -116,6 +166,35 @@ func (c *Client) Page(ctx context.Context, cursor string) (*model.Page, error) {
 		return nil, fmt.Errorf("decode page: %w", err)
 	}
 	return payload.toPage(c.site.ID), nil
+}
+
+// parseRetryAfter 支持秒数与 HTTP-date 两种格式。上限截断，避免上游
+// 给出过长的等待导致站点长期停滞。
+func parseRetryAfter(v string) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		if n < 0 {
+			return 0
+		}
+		d := time.Duration(n) * time.Second
+		if d > 5*time.Minute {
+			d = 5 * time.Minute
+		}
+		return d
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		d := time.Until(t)
+		if d < 0 {
+			return 0
+		}
+		if d > 5*time.Minute {
+			d = 5 * time.Minute
+		}
+		return d
+	}
+	return 0
 }
 
 type wirePage struct {

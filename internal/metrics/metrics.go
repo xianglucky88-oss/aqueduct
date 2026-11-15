@@ -35,11 +35,24 @@ func Open(ctx context.Context, url string) (*Requests, error) {
 // Close 关闭连接。
 func (r *Requests) Close() error { return r.rdb.Close() }
 
+// Ping 供就绪探针检查。Redis 是可降级依赖，失败只影响计数。
+func (r *Requests) Ping(ctx context.Context) error {
+	if r == nil || r.rdb == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	return r.rdb.Ping(ctx).Err()
+}
+
 // Incr 为站点累加一次请求计数。键按分钟分桶，保留 2 小时。
 func (r *Requests) Incr(ctx context.Context, siteID string) {
 	if r == nil || r.rdb == nil {
 		return
 	}
+	// 计数失败不得阻塞采集：使用独立短超时，且忽略错误。
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
 	key := fmt.Sprintf("aq:req:%s:%s", siteID, time.Now().UTC().Format("20060102T1504"))
 	pipe := r.rdb.Pipeline()
 	pipe.Incr(ctx, key)

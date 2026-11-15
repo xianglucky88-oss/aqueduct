@@ -1,6 +1,17 @@
 database_url: postgres://aqueduct:aqueduct@db:5432/aqueduct?sslmode=disable
 redis_url: redis://cache:6379/0
 
+# 运行参数（与 deploy/k8s.yaml 保持同一组默认值）。
+lease_ttl: 45s
+lease_renew_interval: 15s
+shutdown_grace: 20s
+scheduler_poll: 1s
+max_concurrent_sites: 2
+readiness_cache_ttl: 2s
+db_max_open_conns: 8
+db_max_idle_conns: 2
+max_pages: 200
+
 sites:
   - id: supplier
     base_url: http://mocktarget:9100
